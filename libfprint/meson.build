@@ -131,6 +131,8 @@ driver_sources = {
         [ 'drivers/vfs0050.c' ],
     'elan' :
         [ 'drivers/elan.c' ],
+    'elanpress' :
+        [ 'drivers/elanpress.c', 'drivers/elanpress-match.c' ],
     'elanmoc' :
         [ 'drivers/elanmoc/elanmoc.c' ],
     'elanspi' :

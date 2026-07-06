@@ -134,6 +134,7 @@ default_drivers = [
     'vcom5s',
     'synaptics',
     'elan',
+    'elanpress',
     'elanmoc',
     'uru4000',
     'upektc',
