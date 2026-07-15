@@ -41,7 +41,26 @@
 
           # create devShells.default
           devenv.shells.default = {
-            # devenv settings, e.g.
+            packages = with pkgs; [
+              pkg-config
+              meson
+              ninja
+              cmake
+              openssl
+              nss
+              pixman
+              # gusb
+              # gtk-doc
+              # docbook_xsl_ns
+              # docbook_xml_dtd_43
+              # gobject-introspection
+              # cairo
+              # libgudev
+
+              # standalone stuff
+              libusb1
+              gcc
+            ];
             languages.c.enable = true;
           };
 
