@@ -1,3 +1,5 @@
 *.o
 *.swp
 _build
+/.devenv
+/.direnv
