@@ -174,8 +174,8 @@ elanpress_ncc_at (const guint8 *a, const guint8 *b, int w, int h,
 
 /* best zero-mean normalized cross-correlation over translations: coarse
  * grid first, then refinement around the best hit */
-gdouble
-elanpress_ncc_best (const guint8 *a, const guint8 *b, int w, int h)
+static gdouble
+elanpress_ncc_best_translation (const guint8 *a, const guint8 *b, int w, int h)
 {
   gdouble best = -1.0, c;
   int best_dx = 0, best_dy = 0;
@@ -199,6 +199,43 @@ elanpress_ncc_best (const guint8 *a, const guint8 *b, int w, int h)
         if (c > best)
           best = c;
       }
+
+  return best;
+}
+
+/* nearest-neighbour rotation of b around its centre by theta radians,
+ * out-of-bounds samples read as 0 */
+static void
+elanpress_rotate_image (const guint8 *in, guint8 *out, int w, int h, gdouble theta)
+{
+  gdouble cx = w / 2.0, cy = h / 2.0, ct = cos (theta), st = sin (theta);
+
+  for (int y = 0; y < h; y++)
+    for (int x = 0; x < w; x++)
+      {
+        int sx = (int) round (cx + (x - cx) * ct + (y - cy) * st);
+        int sy = (int) round (cy - (x - cx) * st + (y - cy) * ct);
+
+        out[y * w + x] = (sx >= 0 && sx < w && sy >= 0 && sy < h) ?
+                         in[sy * w + sx] : 0;
+      }
+}
+
+/* best correlation over both translation and small rotations of b, so a
+ * touch that landed at a slightly different angle than the enrolled image
+ * still matches */
+gdouble
+elanpress_ncc_best (const guint8 *a, const guint8 *b, int w, int h)
+{
+  g_autofree guint8 *rotated = g_malloc (w * h);
+  gdouble best = -1.0;
+
+  for (gdouble deg = -ELANPRESS_NCC_MAX_ROT_DEG; deg <= ELANPRESS_NCC_MAX_ROT_DEG;
+       deg += ELANPRESS_NCC_ROT_STEP_DEG)
+    {
+      elanpress_rotate_image (b, rotated, w, h, deg * G_PI / 180.0);
+      best = MAX (best, elanpress_ncc_best_translation (a, rotated, w, h));
+    }
 
   return best;
 }

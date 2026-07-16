@@ -34,6 +34,11 @@
 #define ELANPRESS_NCC_MAX_DY 20
 #define ELANPRESS_NCC_MIN_OVERLAP_PX 1500
 
+/* small placement-rotation tolerance: a press on a small unconstrained pad
+ * doesn't land at the same angle each time */
+#define ELANPRESS_NCC_MAX_ROT_DEG 12
+#define ELANPRESS_NCC_ROT_STEP_DEG 4
+
 void     elanpress_rotate_frame (const guint8 *raw, unsigned short *out,
                                  int w, int h);
 guint8 * elanpress_process_frames (GSList *frames, int num_frames,
