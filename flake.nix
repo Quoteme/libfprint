@@ -59,7 +59,6 @@
 
               # standalone stuff
               libusb1
-              gcc
             ];
             languages.c.enable = true;
           };
