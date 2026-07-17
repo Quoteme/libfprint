@@ -193,6 +193,21 @@ elanpress_read (FpiSsm *ssm, FpDevice *dev, guint8 ep, gsize len,
                            callback, NULL);
 }
 
+/* === stop helper: turn the sensor off after an action === */
+
+static void
+elanpress_send_stop (FpDevice *dev)
+{
+  g_autoptr(FpiUsbTransfer) transfer = fpi_usb_transfer_new (dev);
+  g_autoptr(GError) error = NULL;
+
+  fpi_usb_transfer_fill_bulk_full (transfer, ELANPRESS_EP_CMD_OUT,
+                                   (guint8 *) cmd_stop, ELANPRESS_CMD_LEN,
+                                   NULL);
+  if (!fpi_usb_transfer_submit_sync (transfer, ELANPRESS_CMD_TIMEOUT, &error))
+    fp_warn ("failed to send stop command: %s", error->message);
+}
+
 /* === touch capture state machine === */
 
 enum capture_states {
@@ -280,7 +295,13 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
     case CAPTURE_BG_REQUEST:
       if (self->finger_byte == ELANPRESS_FINGER_PRESENT)
         {
-          /* previous touch still on the sensor */
+          /* previous touch still on the sensor; a bare repeated pre_scan
+           * query with no cmd_get_image in between leaves the sensor's
+           * pre_scan/status transaction open, and it stops answering
+           * after just one more poll (same wedge elanpress_open resyncs
+           * on startup) - send cmd_stop to close it out before polling
+           * again */
+          elanpress_send_stop (dev);
           fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_OFF_SEND,
                                          ELANPRESS_POLL_INTERVAL_MS);
           break;
@@ -323,11 +344,15 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
               fp_dbg ("finger lifted after only %d frames, retrying",
                       self->num_frames);
               elanpress_reset_capture (self);
+              elanpress_send_stop (dev);
               fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_ON_SEND,
                                              ELANPRESS_POLL_INTERVAL_MS);
             }
           else
             {
+              /* waiting for the finger to touch down: same bare repeated
+               * pre_scan wedge as above, re-arm before the next poll */
+              elanpress_send_stop (dev);
               fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_ON_SEND,
                                              ELANPRESS_POLL_INTERVAL_MS);
             }
@@ -364,21 +389,6 @@ elanpress_capture_touch (FpiDeviceElanPress *self, FpiSsmCompletedCallback done)
   ssm = fpi_ssm_new (FP_DEVICE (self), capture_run_state,
                      CAPTURE_NUM_STATES + 1);
   fpi_ssm_start (ssm, done);
-}
-
-/* === stop helper: turn the sensor off after an action === */
-
-static void
-elanpress_send_stop (FpDevice *dev)
-{
-  g_autoptr(FpiUsbTransfer) transfer = fpi_usb_transfer_new (dev);
-  g_autoptr(GError) error = NULL;
-
-  fpi_usb_transfer_fill_bulk_full (transfer, ELANPRESS_EP_CMD_OUT,
-                                   (guint8 *) cmd_stop, ELANPRESS_CMD_LEN,
-                                   NULL);
-  if (!fpi_usb_transfer_submit_sync (transfer, ELANPRESS_CMD_TIMEOUT, &error))
-    fp_warn ("failed to send stop command: %s", error->message);
 }
 
 /* === enroll === */
