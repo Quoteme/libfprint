@@ -39,10 +39,8 @@
 #define ELANPRESS_NCC_MAX_ROT_DEG 12
 #define ELANPRESS_NCC_ROT_STEP_DEG 4
 
-/* per-frame finger-presence threshold: mean positive background-subtracted
- * pixel delta a freshly captured frame needs to count as "touched". Measured
- * on a live sensor: ~450 residual with no finger on the pad (LED/thermal
- * drift) vs. ~4800 with a finger pressed - this sits well clear of both */
+/* mean positive per-pixel delta vs background to call a frame "touched";
+ * live capture measured ~450 with no finger, ~4800 with one pressed */
 #define ELANPRESS_TOUCH_MIN_MEAN_DELTA 1500
 
 void     elanpress_rotate_frame (const guint8 *raw, unsigned short *out,

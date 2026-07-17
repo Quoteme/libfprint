@@ -211,18 +211,9 @@ elanpress_send_stop (FpDevice *dev)
 
 /* === touch capture state machine === */
 
-/*
- * cmd_pre_scan's status byte can only ever be queried once per power-up:
- * the very first query after boot answers correctly, but every following
- * one times out, and nothing - cmd_stop, a real libusb_reset_device(),
- * even an unbind/rebind of the USB device - brings it back short of a
- * full reboot. cmd_get_image has none of that: it answers unconditionally
- * and indefinitely on repeat polling, regardless of finger presence. So
- * instead of asking the sensor "is a finger down?", we poll by repeatedly
- * grabbing an image and checking it against the background ourselves
- * (elanpress_frame_has_touch) - this doubles as the actual touch frame
- * when a finger is detected, no separate query needed.
- */
+/* cmd_pre_scan's status byte only ever answers once per power-up and then
+ * wedges permanently, so finger presence is inferred from the image itself
+ * (elanpress_frame_has_touch) rather than queried */
 
 enum capture_states {
   CAPTURE_LED_ON,
@@ -302,7 +293,6 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     default:
-      /* post-frame decision point: is the frame we just grabbed a touch? */
       if (elanpress_frame_has_touch (self->last_frame, self->background,
                                      elanpress_frame_size (self)))
         {
@@ -604,9 +594,7 @@ elanpress_open (FpDevice *dev)
       return;
     }
 
-  /* a prior session (crashed driver, killed daemon, interrupted probe run)
-   * may have left the sensor mid-action (e.g. LED still on); get it back
-   * to idle unconditionally before use */
+  /* a prior crashed/killed session may have left the sensor mid-action; force it idle before use */
   elanpress_send_stop (dev);
 
   fpi_ssm_start (fpi_ssm_new (dev, open_run_state, OPEN_NUM_STATES),
