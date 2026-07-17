@@ -615,6 +615,12 @@ elanpress_open (FpDevice *dev)
 {
   GError *error = NULL;
 
+  if (!g_usb_device_reset (fpi_device_get_usb_device (dev), &error))
+    {
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+
   if (!g_usb_device_claim_interface (fpi_device_get_usb_device (dev),
                                      0, 0, &error))
     {
