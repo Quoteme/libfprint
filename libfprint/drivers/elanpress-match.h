@@ -39,6 +39,12 @@
 #define ELANPRESS_NCC_MAX_ROT_DEG 12
 #define ELANPRESS_NCC_ROT_STEP_DEG 4
 
+/* per-frame finger-presence threshold: mean positive background-subtracted
+ * pixel delta a freshly captured frame needs to count as "touched". Measured
+ * on a live sensor: ~450 residual with no finger on the pad (LED/thermal
+ * drift) vs. ~4800 with a finger pressed - this sits well clear of both */
+#define ELANPRESS_TOUCH_MIN_MEAN_DELTA 1500
+
 void     elanpress_rotate_frame (const guint8 *raw, unsigned short *out,
                                  int w, int h);
 guint8 * elanpress_process_frames (GSList *frames, int num_frames,
@@ -46,3 +52,6 @@ guint8 * elanpress_process_frames (GSList *frames, int num_frames,
                                    unsigned int size);
 gdouble  elanpress_ncc_best (const guint8 *a, const guint8 *b,
                              int w, int h);
+gboolean elanpress_frame_has_touch (const unsigned short *frame,
+                                    const unsigned short *background,
+                                    unsigned int size);

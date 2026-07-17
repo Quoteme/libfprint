@@ -134,6 +134,30 @@ elanpress_process_frames (GSList *frames, int num_frames,
   return out;
 }
 
+/* quick single-frame finger-presence test: sums how much brighter each
+ * pixel is than the background frame. cmd_get_image is the only sensor
+ * command that reliably answers on repeated polling (cmd_pre_scan's
+ * status byte wedges the sensor after a single query - see elanpress.c),
+ * so finger presence has to be inferred from the image itself rather than
+ * asked for */
+gboolean
+elanpress_frame_has_touch (const unsigned short *frame,
+                          const unsigned short *background,
+                          unsigned int size)
+{
+  gint64 sum = 0;
+
+  for (unsigned int i = 0; i < size; i++)
+    {
+      int d = (int) frame[i] - (int) background[i];
+
+      if (d > 0)
+        sum += d;
+    }
+
+  return sum > (gint64) size * ELANPRESS_TOUCH_MIN_MEAN_DELTA;
+}
+
 static gdouble
 elanpress_ncc_at (const guint8 *a, const guint8 *b, int w, int h,
                   int dx, int dy)
