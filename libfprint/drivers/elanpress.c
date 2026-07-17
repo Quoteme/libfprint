@@ -622,6 +622,12 @@ elanpress_open (FpDevice *dev)
       return;
     }
 
+  /* a prior session (crashed driver, killed daemon, interrupted probe run)
+   * may have died mid pre_scan/status cycle and left the sensor's firmware
+   * state machine mid-transaction, where it stops answering entirely until
+   * something sends cmd_stop again; resync unconditionally before use */
+  elanpress_send_stop (dev);
+
   fpi_ssm_start (fpi_ssm_new (dev, open_run_state, OPEN_NUM_STATES),
                  open_complete);
 }
