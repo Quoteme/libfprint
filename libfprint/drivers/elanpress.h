@@ -41,9 +41,6 @@
 /* interval between finger presence polls */
 #define ELANPRESS_POLL_INTERVAL_MS 30
 
-/* pre_scan response when a finger is on the sensor */
-#define ELANPRESS_FINGER_PRESENT 0x55
-
 /* frames captured per touch; the finger is static so these only serve to
  * average out noise */
 #define ELANPRESS_MIN_FRAMES 3

@@ -39,6 +39,10 @@
 #define ELANPRESS_NCC_MAX_ROT_DEG 12
 #define ELANPRESS_NCC_ROT_STEP_DEG 4
 
+/* mean positive per-pixel delta vs background to call a frame "touched";
+ * live capture measured ~450 with no finger, ~4800 with one pressed */
+#define ELANPRESS_TOUCH_MIN_MEAN_DELTA 1500
+
 void     elanpress_rotate_frame (const guint8 *raw, unsigned short *out,
                                  int w, int h);
 guint8 * elanpress_process_frames (GSList *frames, int num_frames,
@@ -46,3 +50,6 @@ guint8 * elanpress_process_frames (GSList *frames, int num_frames,
                                    unsigned int size);
 gdouble  elanpress_ncc_best (const guint8 *a, const guint8 *b,
                              int w, int h);
+gboolean elanpress_frame_has_touch (const unsigned short *frame,
+                                    const unsigned short *background,
+                                    unsigned int size);

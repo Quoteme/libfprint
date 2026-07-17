@@ -24,7 +24,6 @@
 #include "elanpress-match.h"
 
 static const guint8 cmd_led_on[ELANPRESS_CMD_LEN] = {0x40, 0x31};
-static const guint8 cmd_pre_scan[ELANPRESS_CMD_LEN] = {0x40, 0x3f};
 static const guint8 cmd_get_image[ELANPRESS_CMD_LEN] = {0x00, 0x09};
 static const guint8 cmd_stop[ELANPRESS_CMD_LEN] = {0x00, 0x0b};
 static const guint8 cmd_get_sensor_dim[ELANPRESS_CMD_LEN] = {0x00, 0x0c};
@@ -39,6 +38,9 @@ struct _FpiDeviceElanPress
   /* raw background frame (no finger), rotated to row-major */
   unsigned short *background;
 
+  /* most recently captured frame, not yet classified as touch/no-touch */
+  unsigned short *last_frame;
+
   /* rotated raw frames of the touch being captured */
   GSList         *frames;
   int             num_frames;
@@ -46,8 +48,6 @@ struct _FpiDeviceElanPress
   /* processed images collected during enrollment */
   GPtrArray      *enroll_images;
   int             enroll_stage;
-
-  guint8          finger_byte;
 };
 
 G_DEFINE_TYPE (FpiDeviceElanPress, fpi_device_elanpress, FP_TYPE_DEVICE);
@@ -163,6 +163,7 @@ elanpress_reset_capture (FpiDeviceElanPress *self)
 {
   g_slist_free_full (g_steal_pointer (&self->frames), g_free);
   self->num_frames = 0;
+  g_clear_pointer (&self->last_frame, g_free);
 }
 
 static void
@@ -193,36 +194,35 @@ elanpress_read (FpiSsm *ssm, FpDevice *dev, guint8 ep, gsize len,
                            callback, NULL);
 }
 
+/* === stop helper: turn the sensor off after an action === */
+
+static void
+elanpress_send_stop (FpDevice *dev)
+{
+  g_autoptr(FpiUsbTransfer) transfer = fpi_usb_transfer_new (dev);
+  g_autoptr(GError) error = NULL;
+
+  fpi_usb_transfer_fill_bulk_full (transfer, ELANPRESS_EP_CMD_OUT,
+                                   (guint8 *) cmd_stop, ELANPRESS_CMD_LEN,
+                                   NULL);
+  if (!fpi_usb_transfer_submit_sync (transfer, ELANPRESS_CMD_TIMEOUT, &error))
+    fp_warn ("failed to send stop command: %s", error->message);
+}
+
 /* === touch capture state machine === */
+
+/* cmd_pre_scan's status byte only ever answers once per power-up and then
+ * wedges permanently, so finger presence is inferred from the image itself
+ * (elanpress_frame_has_touch) rather than queried */
 
 enum capture_states {
   CAPTURE_LED_ON,
-  CAPTURE_WAIT_OFF_SEND,
-  CAPTURE_WAIT_OFF_READ,
-  CAPTURE_BG_REQUEST,
+  CAPTURE_BG_SEND,
   CAPTURE_BG_READ,
-  CAPTURE_WAIT_ON_SEND,
-  CAPTURE_WAIT_ON_READ,
-  CAPTURE_FRAME_REQUEST,
-  CAPTURE_FRAME_READ,
+  CAPTURE_POLL_SEND,
+  CAPTURE_POLL_READ,
   CAPTURE_NUM_STATES,
 };
-
-static void
-elanpress_status_cb (FpiUsbTransfer *transfer, FpDevice *dev,
-                     gpointer user_data, GError *error)
-{
-  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
-
-  if (error)
-    {
-      fpi_ssm_mark_failed (transfer->ssm, error);
-      return;
-    }
-
-  self->finger_byte = transfer->buffer[0];
-  fpi_ssm_next_state (transfer->ssm);
-}
 
 static void
 elanpress_frame_cb (FpiUsbTransfer *transfer, FpDevice *dev,
@@ -249,8 +249,8 @@ elanpress_frame_cb (FpiUsbTransfer *transfer, FpDevice *dev,
     }
   else
     {
-      self->frames = g_slist_prepend (self->frames, frame);
-      self->num_frames++;
+      g_free (self->last_frame);
+      self->last_frame = frame;
     }
 
   fpi_ssm_next_state (transfer->ssm);
@@ -268,27 +268,10 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       elanpress_send_cmd (ssm, dev, cmd_led_on);
       break;
 
-    case CAPTURE_WAIT_OFF_SEND:
-      elanpress_send_cmd (ssm, dev, cmd_pre_scan);
-      break;
-
-    case CAPTURE_WAIT_OFF_READ:
-      elanpress_read (ssm, dev, ELANPRESS_EP_CMD_IN, 1,
-                      ELANPRESS_CMD_TIMEOUT, elanpress_status_cb);
-      break;
-
-    case CAPTURE_BG_REQUEST:
-      if (self->finger_byte == ELANPRESS_FINGER_PRESENT)
-        {
-          /* previous touch still on the sensor */
-          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_OFF_SEND,
-                                         ELANPRESS_POLL_INTERVAL_MS);
-          break;
-        }
+    case CAPTURE_BG_SEND:
       if (self->background)
         {
-          fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
-          fpi_ssm_jump_to_state (ssm, CAPTURE_WAIT_ON_SEND);
+          fpi_ssm_jump_to_state (ssm, CAPTURE_POLL_SEND);
           break;
         }
       elanpress_send_cmd (ssm, dev, cmd_get_image);
@@ -299,57 +282,55 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
                       ELANPRESS_FRAME_TIMEOUT, elanpress_frame_cb);
       break;
 
-    case CAPTURE_WAIT_ON_SEND:
+    case CAPTURE_POLL_SEND:
       fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
-      elanpress_send_cmd (ssm, dev, cmd_pre_scan);
-      break;
-
-    case CAPTURE_WAIT_ON_READ:
-      elanpress_read (ssm, dev, ELANPRESS_EP_CMD_IN, 1,
-                      ELANPRESS_CMD_TIMEOUT, elanpress_status_cb);
-      break;
-
-    case CAPTURE_FRAME_REQUEST:
-      if (self->finger_byte != ELANPRESS_FINGER_PRESENT)
-        {
-          if (self->num_frames >= ELANPRESS_MIN_FRAMES)
-            {
-              /* finger lifted after enough frames: touch complete */
-              fpi_ssm_mark_completed (ssm);
-            }
-          else if (self->num_frames > 0)
-            {
-              /* bounced touch, start over */
-              fp_dbg ("finger lifted after only %d frames, retrying",
-                      self->num_frames);
-              elanpress_reset_capture (self);
-              fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_ON_SEND,
-                                             ELANPRESS_POLL_INTERVAL_MS);
-            }
-          else
-            {
-              fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_WAIT_ON_SEND,
-                                             ELANPRESS_POLL_INTERVAL_MS);
-            }
-          break;
-        }
-      fpi_device_report_finger_status (dev,
-                                       FP_FINGER_STATUS_NEEDED |
-                                       FP_FINGER_STATUS_PRESENT);
       elanpress_send_cmd (ssm, dev, cmd_get_image);
       break;
 
-    case CAPTURE_FRAME_READ:
+    case CAPTURE_POLL_READ:
       elanpress_read (ssm, dev, ELANPRESS_EP_IMG_IN, frame_bytes,
                       ELANPRESS_FRAME_TIMEOUT, elanpress_frame_cb);
       break;
 
     default:
-      /* after a frame: capture more, or finish at the cap */
-      if (self->num_frames >= ELANPRESS_MAX_FRAMES)
-        fpi_ssm_mark_completed (ssm);
+      if (elanpress_frame_has_touch (self->last_frame, self->background,
+                                     elanpress_frame_size (self)))
+        {
+          self->frames = g_slist_prepend (self->frames,
+                                          g_steal_pointer (&self->last_frame));
+          self->num_frames++;
+          fpi_device_report_finger_status (dev,
+                                           FP_FINGER_STATUS_NEEDED |
+                                           FP_FINGER_STATUS_PRESENT);
+          if (self->num_frames >= ELANPRESS_MAX_FRAMES)
+            fpi_ssm_mark_completed (ssm);
+          else
+            fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_POLL_SEND,
+                                           ELANPRESS_POLL_INTERVAL_MS);
+          break;
+        }
+
+      g_clear_pointer (&self->last_frame, g_free);
+      if (self->num_frames >= ELANPRESS_MIN_FRAMES)
+        {
+          /* finger lifted after enough frames: touch complete */
+          fpi_ssm_mark_completed (ssm);
+        }
+      else if (self->num_frames > 0)
+        {
+          /* bounced touch, start over */
+          fp_dbg ("finger lifted after only %d frames, retrying",
+                  self->num_frames);
+          elanpress_reset_capture (self);
+          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_POLL_SEND,
+                                         ELANPRESS_POLL_INTERVAL_MS);
+        }
       else
-        fpi_ssm_jump_to_state (ssm, CAPTURE_WAIT_ON_SEND);
+        {
+          /* still waiting for the finger to touch down */
+          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_POLL_SEND,
+                                         ELANPRESS_POLL_INTERVAL_MS);
+        }
       break;
     }
 }
@@ -364,21 +345,6 @@ elanpress_capture_touch (FpiDeviceElanPress *self, FpiSsmCompletedCallback done)
   ssm = fpi_ssm_new (FP_DEVICE (self), capture_run_state,
                      CAPTURE_NUM_STATES + 1);
   fpi_ssm_start (ssm, done);
-}
-
-/* === stop helper: turn the sensor off after an action === */
-
-static void
-elanpress_send_stop (FpDevice *dev)
-{
-  g_autoptr(FpiUsbTransfer) transfer = fpi_usb_transfer_new (dev);
-  g_autoptr(GError) error = NULL;
-
-  fpi_usb_transfer_fill_bulk_full (transfer, ELANPRESS_EP_CMD_OUT,
-                                   (guint8 *) cmd_stop, ELANPRESS_CMD_LEN,
-                                   NULL);
-  if (!fpi_usb_transfer_submit_sync (transfer, ELANPRESS_CMD_TIMEOUT, &error))
-    fp_warn ("failed to send stop command: %s", error->message);
 }
 
 /* === enroll === */
@@ -615,12 +581,21 @@ elanpress_open (FpDevice *dev)
 {
   GError *error = NULL;
 
+  if (!g_usb_device_reset (fpi_device_get_usb_device (dev), &error))
+    {
+      fpi_device_open_complete (dev, error);
+      return;
+    }
+
   if (!g_usb_device_claim_interface (fpi_device_get_usb_device (dev),
                                      0, 0, &error))
     {
       fpi_device_open_complete (dev, error);
       return;
     }
+
+  /* a prior crashed/killed session may have left the sensor mid-action; force it idle before use */
+  elanpress_send_stop (dev);
 
   fpi_ssm_start (fpi_ssm_new (dev, open_run_state, OPEN_NUM_STATES),
                  open_complete);
