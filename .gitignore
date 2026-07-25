@@ -3,3 +3,4 @@
 _build
 /.devenv
 /.direnv
+/.cache
