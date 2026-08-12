@@ -134,6 +134,30 @@ elanpress_process_frames (GSList *frames, int num_frames,
   return out;
 }
 
+/* standard deviation of pixel values in a normalized touch image, as a
+ * cheap proxy for how much ridge contrast it actually contains; flat,
+ * low-contrast captures correlate poorly against everything (genuine or
+ * not) so it is better to reject them at capture time than to store or
+ * match against them */
+gdouble
+elanpress_image_quality (const guint8 *img, unsigned int size)
+{
+  gdouble sum = 0, sum_sq = 0, mean;
+
+  for (unsigned int i = 0; i < size; i++)
+    sum += img[i];
+  mean = sum / size;
+
+  for (unsigned int i = 0; i < size; i++)
+    {
+      gdouble d = img[i] - mean;
+
+      sum_sq += d * d;
+    }
+
+  return sqrt (sum_sq / size);
+}
+
 /* sums how much brighter each pixel is than the background frame, to infer
  * a touch without relying on cmd_pre_scan (see elanpress.c) */
 gboolean
@@ -223,8 +247,11 @@ elanpress_ncc_best_translation (const guint8 *a, const guint8 *b, int w, int h)
   return best;
 }
 
-/* nearest-neighbour rotation of b around its centre by theta radians,
- * out-of-bounds samples read as 0 */
+/* bilinear rotation of b around its centre by theta radians; out-of-bounds
+ * corners contribute 0, so edges fade out instead of the hard cutoff a
+ * nearest-neighbour sample would give, which correlates a little more
+ * forgivingly and avoids the extra quantization noise nearest-neighbour
+ * adds at non-multiple-of-90-degree angles */
 static void
 elanpress_rotate_image (const guint8 *in, guint8 *out, int w, int h, gdouble theta)
 {
@@ -233,28 +260,69 @@ elanpress_rotate_image (const guint8 *in, guint8 *out, int w, int h, gdouble the
   for (int y = 0; y < h; y++)
     for (int x = 0; x < w; x++)
       {
-        int sx = (int) round (cx + (x - cx) * ct + (y - cy) * st);
-        int sy = (int) round (cy - (x - cx) * st + (y - cy) * ct);
+        gdouble sx = cx + (x - cx) * ct + (y - cy) * st;
+        gdouble sy = cy - (x - cx) * st + (y - cy) * ct;
+        int x0 = (int) floor (sx), y0 = (int) floor (sy);
+        gdouble fx = sx - x0, fy = sy - y0;
+        gdouble acc = 0;
 
-        out[y * w + x] = (sx >= 0 && sx < w && sy >= 0 && sy < h) ?
-                         in[sy * w + sx] : 0;
+        for (int dy = 0; dy <= 1; dy++)
+          for (int dx = 0; dx <= 1; dx++)
+            {
+              int sxi = x0 + dx, syi = y0 + dy;
+              gdouble wgt = (dx ? fx : 1 - fx) * (dy ? fy : 1 - fy);
+
+              if (sxi >= 0 && sxi < w && syi >= 0 && syi < h)
+                acc += wgt * in[syi * w + sxi];
+            }
+        out[y * w + x] = (guint8) CLAMP (lround (acc), 0, 255);
       }
 }
 
 /* best correlation over both translation and small rotations of b, so a
  * touch that landed at a slightly different angle than the enrolled image
- * still matches */
+ * still matches. The angle grid is coarse (ELANPRESS_NCC_ROT_STEP_DEG), so
+ * on top of it a parabola is fit through the best sample and its two
+ * neighbours to estimate the true (sub-degree) peak, which is then
+ * re-checked with one extra rotation+search - the same trick used for
+ * sub-pixel peak estimation in image correlation/optical-flow literature,
+ * applied here to the rotation axis instead of translation. */
 gdouble
 elanpress_ncc_best (const guint8 *a, const guint8 *b, int w, int h)
 {
   g_autofree guint8 *rotated = g_malloc (w * h);
-  gdouble best = -1.0;
+  int n = (int) (2 * ELANPRESS_NCC_MAX_ROT_DEG / ELANPRESS_NCC_ROT_STEP_DEG) + 1;
+  g_autofree gdouble *scores = g_malloc (n * sizeof (gdouble));
+  gdouble best = -1.0, best_deg = 0;
+  int best_i = 0;
 
-  for (gdouble deg = -ELANPRESS_NCC_MAX_ROT_DEG; deg <= ELANPRESS_NCC_MAX_ROT_DEG;
-       deg += ELANPRESS_NCC_ROT_STEP_DEG)
+  for (int i = 0; i < n; i++)
     {
+      gdouble deg = -ELANPRESS_NCC_MAX_ROT_DEG + i * ELANPRESS_NCC_ROT_STEP_DEG;
+
       elanpress_rotate_image (b, rotated, w, h, deg * G_PI / 180.0);
-      best = MAX (best, elanpress_ncc_best_translation (a, rotated, w, h));
+      scores[i] = elanpress_ncc_best_translation (a, rotated, w, h);
+      if (scores[i] > best)
+        {
+          best = scores[i];
+          best_deg = deg;
+          best_i = i;
+        }
+    }
+
+  if (best_i > 0 && best_i < n - 1)
+    {
+      gdouble sl = scores[best_i - 1], sc = scores[best_i], sr = scores[best_i + 1];
+      gdouble denom = sl - 2 * sc + sr;
+
+      if (fabs (denom) > 1e-9)
+        {
+          gdouble offset = CLAMP (0.5 * (sl - sr) / denom, -1.0, 1.0);
+          gdouble refined_deg = best_deg + offset * ELANPRESS_NCC_ROT_STEP_DEG;
+
+          elanpress_rotate_image (b, rotated, w, h, refined_deg * G_PI / 180.0);
+          best = MAX (best, elanpress_ncc_best_translation (a, rotated, w, h));
+        }
     }
 
   return best;

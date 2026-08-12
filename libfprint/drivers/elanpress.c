@@ -368,6 +368,13 @@ elanpress_enroll_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
   image = elanpress_process_touch (self);
   elanpress_reset_capture (self);
 
+  if (image && elanpress_image_quality (image, elanpress_frame_size (self)) <
+      ELANPRESS_MIN_QUALITY_STDDEV)
+    {
+      fp_dbg ("enrolled touch too low-contrast to keep, retrying");
+      g_clear_pointer (&image, g_free);
+    }
+
   if (!image)
     {
       fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
@@ -430,6 +437,13 @@ elanpress_match_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   probe = elanpress_process_touch (self);
   elanpress_reset_capture (self);
+
+  if (probe && elanpress_image_quality (probe, elanpress_frame_size (self)) <
+      ELANPRESS_MIN_QUALITY_STDDEV)
+    {
+      fp_dbg ("touch too low-contrast to match, treating as failed capture");
+      g_clear_pointer (&probe, g_free);
+    }
 
   if (!probe)
     {

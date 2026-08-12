@@ -43,6 +43,13 @@
  * live capture measured ~450 with no finger, ~4800 with one pressed */
 #define ELANPRESS_TOUCH_MIN_MEAN_DELTA 1500
 
+/* enrollment/probe images whose normalized contrast (pixel value std-dev)
+ * falls below this are rejected as unusable (light touch, motion blur, or
+ * finger mostly off the sensor) rather than stored or matched against; a
+ * well-imaged ridge pattern typically lands in the 30-50 range, so this is
+ * set well below that to only catch clearly bad frames */
+#define ELANPRESS_MIN_QUALITY_STDDEV 10.0
+
 void     elanpress_rotate_frame (const guint8 *raw, unsigned short *out,
                                  int w, int h);
 guint8 * elanpress_process_frames (GSList *frames, int num_frames,
@@ -53,3 +60,4 @@ gdouble  elanpress_ncc_best (const guint8 *a, const guint8 *b,
 gboolean elanpress_frame_has_touch (const unsigned short *frame,
                                     const unsigned short *background,
                                     unsigned int size);
+gdouble  elanpress_image_quality (const guint8 *img, unsigned int size);
