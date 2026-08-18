@@ -48,6 +48,11 @@ struct _FpiDeviceElanPress
   /* processed images collected during enrollment */
   GPtrArray      *enroll_images;
   int             enroll_stage;
+
+  /* Enrollment stages must be separate touches. Without this guard, a
+   * finger held on the sensor can be accepted again as the next stage. */
+  gboolean        wait_for_finger_off;
+  guint           finger_off_frames;
 };
 
 G_DEFINE_TYPE (FpiDeviceElanPress, fpi_device_elanpress, FP_TYPE_DEVICE);
@@ -261,6 +266,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
   gsize frame_bytes = elanpress_frame_size (self) * 2;
+  gboolean has_touch;
 
   switch (fpi_ssm_get_cur_state (ssm))
     {
@@ -293,8 +299,28 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     default:
-      if (elanpress_frame_has_touch (self->last_frame, self->background,
-                                     elanpress_frame_size (self)))
+      has_touch = elanpress_frame_has_touch (self->last_frame,
+                                             self->background,
+                                             elanpress_frame_size (self));
+
+      if (self->wait_for_finger_off)
+        {
+          g_clear_pointer (&self->last_frame, g_free);
+          if (has_touch)
+            self->finger_off_frames = 0;
+          else if (++self->finger_off_frames >= ELANPRESS_FINGER_OFF_FRAMES)
+            {
+              fp_dbg ("finger lifted between enrollment stages");
+              self->wait_for_finger_off = FALSE;
+              self->finger_off_frames = 0;
+              fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NEEDED);
+            }
+          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_POLL_SEND,
+                                         ELANPRESS_POLL_INTERVAL_MS);
+          break;
+        }
+
+      if (has_touch)
         {
           self->frames = g_slist_prepend (self->frames,
                                           g_steal_pointer (&self->last_frame));
@@ -389,6 +415,8 @@ elanpress_enroll_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 
   if (self->enroll_stage < ELANPRESS_ENROLL_STAGES)
     {
+      self->wait_for_finger_off = TRUE;
+      self->finger_off_frames = 0;
       elanpress_capture_touch (self, elanpress_enroll_touch_done);
       return;
     }
@@ -408,6 +436,8 @@ elanpress_enroll (FpDevice *dev)
   FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
 
   self->enroll_stage = 0;
+  self->wait_for_finger_off = FALSE;
+  self->finger_off_frames = 0;
   g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
   self->enroll_images = g_ptr_array_new_with_free_func (g_free);
 
