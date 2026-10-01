@@ -178,48 +178,105 @@ elanpress_frame_has_touch (const unsigned short *frame,
   return sum > (gint64) size * ELANPRESS_TOUCH_MIN_MEAN_DELTA;
 }
 
+/* summed-area tables of an image's pixel values and squared pixel values,
+ * (w + 1) x (h + 1) with a zero first row/column, so the sum over any
+ * overlap rectangle costs four lookups instead of a pass over it */
+typedef struct
+{
+  gint64 *sum;
+  gint64 *sum_sq;
+} ElanpressIntegral;
+
+static void
+elanpress_integral_init (ElanpressIntegral *ii, int w, int h)
+{
+  ii->sum = g_malloc0 ((gsize) (w + 1) * (h + 1) * sizeof (gint64));
+  ii->sum_sq = g_malloc0 ((gsize) (w + 1) * (h + 1) * sizeof (gint64));
+}
+
+static void
+elanpress_integral_clear (ElanpressIntegral *ii)
+{
+  g_clear_pointer (&ii->sum, g_free);
+  g_clear_pointer (&ii->sum_sq, g_free);
+}
+
+static void
+elanpress_integral_fill (ElanpressIntegral *ii, const guint8 *img, int w, int h)
+{
+  int stride = w + 1;
+
+  for (int y = 0; y < h; y++)
+    {
+      gint64 row = 0, row_sq = 0;
+
+      for (int x = 0; x < w; x++)
+        {
+          int px = img[y * w + x];
+
+          row += px;
+          row_sq += px * px;
+          ii->sum[(y + 1) * stride + x + 1] = ii->sum[y * stride + x + 1] + row;
+          ii->sum_sq[(y + 1) * stride + x + 1] = ii->sum_sq[y * stride + x + 1] + row_sq;
+        }
+    }
+}
+
+static inline gint64
+elanpress_integral_rect (const gint64 *t, int stride, int x0, int y0, int x1, int y1)
+{
+  return t[y1 * stride + x1] - t[y0 * stride + x1] - t[y1 * stride + x0] + t[y0 * stride + x0];
+}
+
+/* zero-mean NCC over the overlap of a and b shifted by (dx, dy). Written
+ * in the n-scaled form (n*Sab - Sa*Sb) / sqrt((n*Saa - Sa^2)(n*Sbb - Sb^2)),
+ * which equals the textbook mean-subtracted formula but needs only the
+ * cross term Sab per offset, summed exactly in integers; the other sums
+ * come from the precomputed integral images */
 static gdouble
-elanpress_ncc_at (const guint8 *a, const guint8 *b, int w, int h,
-                  int dx, int dy)
+elanpress_ncc_at (const guint8 *a, const ElanpressIntegral *ia,
+                  const guint8 *b, const ElanpressIntegral *ib,
+                  int w, int h, int dx, int dy)
 {
   int x0 = MAX (0, dx), x1 = MIN (w, w + dx);
   int y0 = MAX (0, dy), y1 = MIN (h, h + dy);
-  long n = (long) (x1 - x0) * (y1 - y0);
-  gdouble sa = 0, sb = 0, ma, mb, num = 0, da = 0, db = 0;
+  int stride = w + 1, len = x1 - x0;
+  gint64 n = (gint64) (x1 - x0) * (y1 - y0);
+  gint64 sa, sb, saa, sbb, sab = 0, da, db;
 
   if (n < ELANPRESS_NCC_MIN_OVERLAP_PX)
     return -1.0;
 
-  for (int y = y0; y < y1; y++)
-    for (int x = x0; x < x1; x++)
-      {
-        sa += a[y * w + x];
-        sb += b[(y - dy) * w + (x - dx)];
-      }
-  ma = sa / n;
-  mb = sb / n;
+  sa = elanpress_integral_rect (ia->sum, stride, x0, y0, x1, y1);
+  saa = elanpress_integral_rect (ia->sum_sq, stride, x0, y0, x1, y1);
+  sb = elanpress_integral_rect (ib->sum, stride, x0 - dx, y0 - dy, x1 - dx, y1 - dy);
+  sbb = elanpress_integral_rect (ib->sum_sq, stride, x0 - dx, y0 - dy, x1 - dx, y1 - dy);
 
-  for (int y = y0; y < y1; y++)
-    for (int x = x0; x < x1; x++)
-      {
-        gdouble va = a[y * w + x] - ma;
-        gdouble vb = b[(y - dy) * w + (x - dx)] - mb;
-
-        num += va * vb;
-        da += va * va;
-        db += vb * vb;
-      }
-
+  da = n * saa - sa * sa;
+  db = n * sbb - sb * sb;
   if (da <= 0 || db <= 0)
     return -1.0;
 
-  return num / sqrt (da * db);
+  for (int y = y0; y < y1; y++)
+    {
+      const guint8 *pa = a + y * w + x0;
+      const guint8 *pb = b + (y - dy) * w + (x0 - dx);
+      guint32 row = 0;
+
+      for (int x = 0; x < len; x++)
+        row += (guint32) pa[x] * pb[x];
+      sab += row;
+    }
+
+  return (gdouble) (n * sab - sa * sb) / sqrt ((gdouble) da * (gdouble) db);
 }
 
 /* best zero-mean normalized cross-correlation over translations: coarse
  * grid first, then refinement around the best hit */
 static gdouble
-elanpress_ncc_best_translation (const guint8 *a, const guint8 *b, int w, int h)
+elanpress_ncc_best_translation (const guint8 *a, const ElanpressIntegral *ia,
+                                const guint8 *b, const ElanpressIntegral *ib,
+                                int w, int h)
 {
   gdouble best = -1.0, c;
   int best_dx = 0, best_dy = 0;
@@ -227,7 +284,7 @@ elanpress_ncc_best_translation (const guint8 *a, const guint8 *b, int w, int h)
   for (int dy = -ELANPRESS_NCC_MAX_DY; dy <= ELANPRESS_NCC_MAX_DY; dy += 2)
     for (int dx = -ELANPRESS_NCC_MAX_DX; dx <= ELANPRESS_NCC_MAX_DX; dx += 3)
       {
-        c = elanpress_ncc_at (a, b, w, h, dx, dy);
+        c = elanpress_ncc_at (a, ia, b, ib, w, h, dx, dy);
         if (c > best)
           {
             best = c;
@@ -239,7 +296,7 @@ elanpress_ncc_best_translation (const guint8 *a, const guint8 *b, int w, int h)
   for (int dy = best_dy - 2; dy <= best_dy + 2; dy++)
     for (int dx = best_dx - 3; dx <= best_dx + 3; dx++)
       {
-        c = elanpress_ncc_at (a, b, w, h, dx, dy);
+        c = elanpress_ncc_at (a, ia, b, ib, w, h, dx, dy);
         if (c > best)
           best = c;
       }
@@ -293,15 +350,21 @@ elanpress_ncc_best (const guint8 *a, const guint8 *b, int w, int h)
   g_autofree guint8 *rotated = g_malloc (w * h);
   int n = (int) (2 * ELANPRESS_NCC_MAX_ROT_DEG / ELANPRESS_NCC_ROT_STEP_DEG) + 1;
   g_autofree gdouble *scores = g_malloc (n * sizeof (gdouble));
+  ElanpressIntegral ia, ir;
   gdouble best = -1.0, best_deg = 0;
   int best_i = 0;
+
+  elanpress_integral_init (&ia, w, h);
+  elanpress_integral_init (&ir, w, h);
+  elanpress_integral_fill (&ia, a, w, h);
 
   for (int i = 0; i < n; i++)
     {
       gdouble deg = -ELANPRESS_NCC_MAX_ROT_DEG + i * ELANPRESS_NCC_ROT_STEP_DEG;
 
       elanpress_rotate_image (b, rotated, w, h, deg * G_PI / 180.0);
-      scores[i] = elanpress_ncc_best_translation (a, rotated, w, h);
+      elanpress_integral_fill (&ir, rotated, w, h);
+      scores[i] = elanpress_ncc_best_translation (a, &ia, rotated, &ir, w, h);
       if (scores[i] > best)
         {
           best = scores[i];
@@ -321,9 +384,12 @@ elanpress_ncc_best (const guint8 *a, const guint8 *b, int w, int h)
           gdouble refined_deg = best_deg + offset * ELANPRESS_NCC_ROT_STEP_DEG;
 
           elanpress_rotate_image (b, rotated, w, h, refined_deg * G_PI / 180.0);
-          best = MAX (best, elanpress_ncc_best_translation (a, rotated, w, h));
+          elanpress_integral_fill (&ir, rotated, w, h);
+          best = MAX (best, elanpress_ncc_best_translation (a, &ia, rotated, &ir, w, h));
         }
     }
 
+  elanpress_integral_clear (&ia);
+  elanpress_integral_clear (&ir);
   return best;
 }
