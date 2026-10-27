@@ -41,7 +41,15 @@
 /* interval between finger presence polls */
 #define ELANPRESS_POLL_INTERVAL_MS 30
 
-/* require a stable finger-off interval before advancing enrollment */
+/* consecutive background frames that may disagree (finger landing) before
+ * the last one is accepted anyway */
+#define ELANPRESS_BG_MAX_TRIES 5
+
+/* idle frames pull the background 1/2^shift of the way towards them */
+#define ELANPRESS_BG_ADAPT_SHIFT 3
+
+/* require a stable finger-off interval before advancing enrollment or
+ * retrying after a failed match */
 #define ELANPRESS_FINGER_OFF_FRAMES 10
 
 /* frames captured per touch; the finger is static so these only serve to

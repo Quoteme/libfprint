@@ -35,8 +35,16 @@ struct _FpiDeviceElanPress
   unsigned short  frame_width;
   unsigned short  frame_height;
 
-  /* raw background frame (no finger), rotated to row-major */
+  /* raw background frame (no finger), rotated to row-major; kept across
+   * actions and slowly adapted to idle frames */
   unsigned short *background;
+
+  /* first of two frames that must agree before becoming the background */
+  unsigned short *bg_candidate;
+  guint           bg_tries;
+
+  /* touch state with hysteresis, see elanpress_update_touch */
+  gboolean        touching;
 
   /* most recently captured frame, not yet classified as touch/no-touch */
   unsigned short *last_frame;
@@ -141,26 +149,6 @@ elanpress_print_get_images (FpiDeviceElanPress *self, FpPrint *print)
   return images;
 }
 
-static gdouble
-elanpress_match_print (FpiDeviceElanPress *self, const guint8 *probe,
-                       FpPrint *print)
-{
-  g_autoptr(GPtrArray) images = elanpress_print_get_images (self, print);
-  gdouble best = -1.0;
-
-  if (!images)
-    return -1.0;
-
-  for (guint i = 0; i < images->len; i++)
-    {
-      gdouble c = elanpress_ncc_best (probe, g_ptr_array_index (images, i),
-                                      self->frame_width, self->frame_height);
-      best = MAX (best, c);
-    }
-
-  return best;
-}
-
 /* === USB helpers === */
 
 static void
@@ -169,6 +157,8 @@ elanpress_reset_capture (FpiDeviceElanPress *self)
   g_slist_free_full (g_steal_pointer (&self->frames), g_free);
   self->num_frames = 0;
   g_clear_pointer (&self->last_frame, g_free);
+  g_clear_pointer (&self->bg_candidate, g_free);
+  self->bg_tries = 0;
 }
 
 static void
@@ -218,7 +208,7 @@ elanpress_send_stop (FpDevice *dev)
 
 /* cmd_pre_scan's status byte only ever answers once per power-up and then
  * wedges permanently, so finger presence is inferred from the image itself
- * (elanpress_frame_has_touch) rather than queried */
+ * (elanpress_frame_delta) rather than queried */
 
 enum capture_states {
   CAPTURE_LED_ON,
@@ -228,6 +218,75 @@ enum capture_states {
   CAPTURE_POLL_READ,
   CAPTURE_NUM_STATES,
 };
+
+/* the background is only accepted once two consecutive frames agree, so a
+ * finger that is just landing doesn't end up in it */
+static void
+elanpress_take_background (FpiDeviceElanPress *self, FpiSsm *ssm,
+                           unsigned short *frame)
+{
+  if (self->bg_candidate)
+    {
+      gdouble pos, neg;
+
+      elanpress_frame_delta (frame, self->bg_candidate,
+                             elanpress_frame_size (self), &pos, &neg);
+      if ((pos < ELANPRESS_TOUCH_OFF_MEAN_DELTA &&
+           neg < ELANPRESS_TOUCH_OFF_MEAN_DELTA) ||
+          ++self->bg_tries >= ELANPRESS_BG_MAX_TRIES)
+        {
+          fp_dbg ("captured background frame (+%.0f/-%.0f vs previous)",
+                  pos, neg);
+          g_free (self->background);
+          self->background = frame;
+          g_clear_pointer (&self->bg_candidate, g_free);
+          self->bg_tries = 0;
+          self->touching = FALSE;
+          fpi_ssm_next_state (ssm);
+          return;
+        }
+    }
+
+  g_free (self->bg_candidate);
+  self->bg_candidate = frame;
+  fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_BG_SEND,
+                                 ELANPRESS_POLL_INTERVAL_MS);
+}
+
+/* classifies last_frame as touched or not, with hysteresis, and keeps the
+ * background healthy: replaced outright if it turns out to have been taken
+ * with a finger on the sensor (very common here, the sensor is the power
+ * button), otherwise slowly adapted to idle frames to follow drift */
+static void
+elanpress_update_touch (FpiDeviceElanPress *self)
+{
+  unsigned int size = elanpress_frame_size (self);
+  gdouble pos, neg;
+  gboolean touching;
+
+  elanpress_frame_delta (self->last_frame, self->background, size, &pos, &neg);
+
+  if (neg > ELANPRESS_TOUCH_OFF_MEAN_DELTA &&
+      pos < ELANPRESS_TOUCH_OFF_MEAN_DELTA)
+    {
+      fp_dbg ("frame much darker than background (-%.0f), background had a finger on it, replacing it",
+              neg);
+      memcpy (self->background, self->last_frame, size * sizeof (short));
+      pos = 0;
+    }
+
+  touching = pos > (self->touching ? ELANPRESS_TOUCH_OFF_MEAN_DELTA :
+                                     ELANPRESS_TOUCH_ON_MEAN_DELTA);
+  if (touching != self->touching)
+    fp_dbg ("finger %s (mean delta +%.0f/-%.0f)",
+            touching ? "down" : "up", pos, neg);
+  self->touching = touching;
+
+  if (!touching)
+    for (unsigned int i = 0; i < size; i++)
+      self->background[i] += ((int) self->last_frame[i] - (int) self->background[i]) /
+                             (1 << ELANPRESS_BG_ADAPT_SHIFT);
+}
 
 static void
 elanpress_frame_cb (FpiUsbTransfer *transfer, FpDevice *dev,
@@ -248,16 +307,12 @@ elanpress_frame_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 
   if (fpi_ssm_get_cur_state (transfer->ssm) == CAPTURE_BG_READ)
     {
-      g_free (self->background);
-      self->background = frame;
-      fp_dbg ("captured background frame");
-    }
-  else
-    {
-      g_free (self->last_frame);
-      self->last_frame = frame;
+      elanpress_take_background (self, transfer->ssm, frame);
+      return;
     }
 
+  g_free (self->last_frame);
+  self->last_frame = frame;
   fpi_ssm_next_state (transfer->ssm);
 }
 
@@ -299,9 +354,8 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       break;
 
     default:
-      has_touch = elanpress_frame_has_touch (self->last_frame,
-                                             self->background,
-                                             elanpress_frame_size (self));
+      elanpress_update_touch (self);
+      has_touch = self->touching;
 
       if (self->wait_for_finger_off)
         {
@@ -446,12 +500,137 @@ elanpress_enroll (FpDevice *dev)
 
 /* === verify and identify === */
 
+/* everything the matching thread needs, owned by the task so the thread
+ * never touches the device or print objects */
+typedef struct
+{
+  guint8    *probe;
+  GPtrArray *galleries;   /* per print: GPtrArray of images, or NULL */
+  gdouble   *scores;      /* per print */
+  int        w, h;
+  gint64     start_us;
+} ElanpressMatchJob;
+
+static void
+elanpress_images_unref (gpointer images)
+{
+  if (images)
+    g_ptr_array_unref (images);
+}
+
+static void
+elanpress_match_job_free (gpointer data)
+{
+  ElanpressMatchJob *job = data;
+
+  g_free (job->probe);
+  g_ptr_array_unref (job->galleries);
+  g_free (job->scores);
+  g_free (job);
+}
+
+static void
+elanpress_match_thread (GTask *task, gpointer source_object,
+                        gpointer task_data, GCancellable *cancellable)
+{
+  ElanpressMatchJob *job = task_data;
+
+  for (guint i = 0; i < job->galleries->len; i++)
+    {
+      GPtrArray *images = g_ptr_array_index (job->galleries, i);
+
+      if (g_task_return_error_if_cancelled (task))
+        return;
+      job->scores[i] = !images ? -1.0 :
+                       elanpress_match_images (job->probe,
+                                               (guint8 *const *) images->pdata,
+                                               images->len, job->w, job->h,
+                                               ELANPRESS_NCC_THRESHOLD,
+                                               cancellable);
+    }
+
+  if (!g_task_return_error_if_cancelled (task))
+    g_task_return_boolean (task, TRUE);
+}
+
+static void
+elanpress_match_done (GObject *source, GAsyncResult *res, gpointer user_data)
+{
+  FpDevice *dev = FP_DEVICE (source);
+  FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
+  FpiDeviceAction action = fpi_device_get_current_action (dev);
+  ElanpressMatchJob *job = g_task_get_task_data (G_TASK (res));
+  GError *error = NULL;
+
+  if (!g_task_propagate_boolean (G_TASK (res), &error))
+    {
+      if (action == FPI_DEVICE_ACTION_IDENTIFY)
+        fpi_device_identify_complete (dev, error);
+      else
+        fpi_device_verify_complete (dev, error);
+      return;
+    }
+
+  fp_dbg ("matching took %" G_GINT64_FORMAT " ms",
+          (g_get_monotonic_time () - job->start_us) / 1000);
+
+  if (action == FPI_DEVICE_ACTION_IDENTIFY)
+    {
+      GPtrArray *gallery = NULL;
+      FpPrint *best_print = NULL;
+      gdouble best = -1.0;
+
+      fpi_device_get_identify_data (dev, &gallery);
+      for (guint i = 0; i < gallery->len; i++)
+        if (job->scores[i] > best)
+          {
+            best = job->scores[i];
+            best_print = g_ptr_array_index (gallery, i);
+          }
+
+      fp_dbg ("best NCC %.3f (threshold %.2f)", best, ELANPRESS_NCC_THRESHOLD);
+      if (best >= ELANPRESS_NCC_THRESHOLD)
+        {
+          fpi_device_identify_report (dev, best_print, NULL, NULL);
+        }
+      else
+        {
+          self->wait_for_finger_off = TRUE;
+          fpi_device_identify_report (dev, NULL, NULL, NULL);
+        }
+      fpi_device_identify_complete (dev, NULL);
+    }
+  else
+    {
+      gdouble c = job->scores[0];
+
+      fp_dbg ("NCC %.3f (threshold %.2f)", c, ELANPRESS_NCC_THRESHOLD);
+
+      if (c < 0)
+        {
+          fpi_device_verify_complete (dev,
+                                      fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
+          return;
+        }
+
+      if (c < ELANPRESS_NCC_THRESHOLD)
+        self->wait_for_finger_off = TRUE;
+      fpi_device_verify_report (dev,
+                                c >= ELANPRESS_NCC_THRESHOLD ?
+                                FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
+                                NULL, NULL);
+      fpi_device_verify_complete (dev, NULL);
+    }
+}
+
 static void
 elanpress_match_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceElanPress *self = FPI_DEVICE_ELANPRESS (dev);
   FpiDeviceAction action = fpi_device_get_current_action (dev);
   g_autofree guint8 *probe = NULL;
+  g_autoptr(GTask) task = NULL;
+  ElanpressMatchJob *job;
 
   fpi_device_report_finger_status (dev, FP_FINGER_STATUS_NONE);
   elanpress_send_stop (dev);
@@ -479,6 +658,8 @@ elanpress_match_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
     {
       GError *retry = fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL);
 
+      /* make the next attempt a fresh touch, not the same failed one */
+      self->wait_for_finger_off = TRUE;
       if (action == FPI_DEVICE_ACTION_IDENTIFY)
         {
           fpi_device_identify_report (dev, NULL, NULL, retry);
@@ -492,54 +673,37 @@ elanpress_match_touch_done (FpiSsm *ssm, FpDevice *dev, GError *error)
       return;
     }
 
+  job = g_new0 (ElanpressMatchJob, 1);
+  job->probe = g_steal_pointer (&probe);
+  job->galleries = g_ptr_array_new_with_free_func (elanpress_images_unref);
+  job->w = self->frame_width;
+  job->h = self->frame_height;
+  job->start_us = g_get_monotonic_time ();
+
   if (action == FPI_DEVICE_ACTION_IDENTIFY)
     {
       GPtrArray *gallery = NULL;
-      FpPrint *best_print = NULL;
-      gdouble best = -1.0;
 
       fpi_device_get_identify_data (dev, &gallery);
       for (guint i = 0; i < gallery->len; i++)
-        {
-          FpPrint *print = g_ptr_array_index (gallery, i);
-          gdouble c = elanpress_match_print (self, probe, print);
-
-          if (c > best)
-            {
-              best = c;
-              best_print = print;
-            }
-        }
-
-      fp_dbg ("best NCC %.3f (threshold %.2f)", best, ELANPRESS_NCC_THRESHOLD);
-      if (best >= ELANPRESS_NCC_THRESHOLD)
-        fpi_device_identify_report (dev, best_print, NULL, NULL);
-      else
-        fpi_device_identify_report (dev, NULL, NULL, NULL);
-      fpi_device_identify_complete (dev, NULL);
+        g_ptr_array_add (job->galleries,
+                         elanpress_print_get_images (self,
+                                                     g_ptr_array_index (gallery, i)));
     }
   else
     {
       FpPrint *print = NULL;
-      gdouble c;
 
       fpi_device_get_verify_data (dev, &print);
-      c = elanpress_match_print (self, probe, print);
-      fp_dbg ("NCC %.3f (threshold %.2f)", c, ELANPRESS_NCC_THRESHOLD);
-
-      if (c < 0)
-        {
-          fpi_device_verify_complete (dev,
-                                      fpi_device_error_new (FP_DEVICE_ERROR_DATA_INVALID));
-          return;
-        }
-
-      fpi_device_verify_report (dev,
-                                c >= ELANPRESS_NCC_THRESHOLD ?
-                                FPI_MATCH_SUCCESS : FPI_MATCH_FAIL,
-                                NULL, NULL);
-      fpi_device_verify_complete (dev, NULL);
+      g_ptr_array_add (job->galleries, elanpress_print_get_images (self, print));
     }
+  job->scores = g_new (gdouble, MAX (job->galleries->len, 1));
+
+  /* matching takes long enough that it must not block the main loop */
+  task = g_task_new (dev, fpi_device_get_cancellable (dev),
+                     elanpress_match_done, NULL);
+  g_task_set_task_data (task, job, elanpress_match_job_free);
+  g_task_run_in_thread (task, elanpress_match_thread);
 }
 
 static void
@@ -654,6 +818,8 @@ elanpress_close (FpDevice *dev)
   elanpress_reset_capture (self);
   g_clear_pointer (&self->background, g_free);
   g_clear_pointer (&self->enroll_images, g_ptr_array_unref);
+  self->touching = FALSE;
+  self->wait_for_finger_off = FALSE;
 
   g_usb_device_release_interface (fpi_device_get_usb_device (dev),
                                   0, 0, &error);

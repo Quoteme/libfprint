@@ -19,7 +19,7 @@
 
 #pragma once
 
-#include <glib.h>
+#include <gio/gio.h>
 
 /* frames dropped at the start (finger settling) and end (possible lift)
  * of a touch when enough frames are available */
@@ -39,9 +39,18 @@
 #define ELANPRESS_NCC_MAX_ROT_DEG 12
 #define ELANPRESS_NCC_ROT_STEP_DEG 4
 
-/* mean positive per-pixel delta vs background to call a frame "touched";
- * live capture measured ~450 with no finger, ~4800 with one pressed */
-#define ELANPRESS_TOUCH_MIN_MEAN_DELTA 1500
+/* mean positive per-pixel delta vs background; live capture measured ~450
+ * with no finger, ~4800 with one pressed. A touch starts above ON and only
+ * ends below OFF, so a touch hovering around one threshold doesn't flicker
+ * and restart the capture over and over */
+#define ELANPRESS_TOUCH_ON_MEAN_DELTA 1500
+#define ELANPRESS_TOUCH_OFF_MEAN_DELTA 900
+
+/* coarse (half-resolution) correlation peaks refined at full resolution */
+#define ELANPRESS_NCC_CANDIDATES 2
+
+/* upper bound on worker threads used by elanpress_match_images */
+#define ELANPRESS_MATCH_MAX_THREADS 8
 
 /* enrollment/probe images whose normalized contrast (pixel value std-dev)
  * falls below this are rejected as unusable (light touch, motion blur, or
@@ -57,7 +66,12 @@ guint8 * elanpress_process_frames (GSList *frames, int num_frames,
                                    unsigned int size);
 gdouble  elanpress_ncc_best (const guint8 *a, const guint8 *b,
                              int w, int h);
-gboolean elanpress_frame_has_touch (const unsigned short *frame,
-                                    const unsigned short *background,
-                                    unsigned int size);
+gdouble  elanpress_match_images (const guint8 *probe,
+                                 guint8 *const *images, guint n_images,
+                                 int w, int h, gdouble threshold,
+                                 GCancellable *cancellable);
+void     elanpress_frame_delta (const unsigned short *frame,
+                                const unsigned short *background,
+                                unsigned int size,
+                                gdouble *pos_mean, gdouble *neg_mean);
 gdouble  elanpress_image_quality (const guint8 *img, unsigned int size);

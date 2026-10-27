@@ -244,6 +244,23 @@ else
     endforeach
 endif
 
+if 'elanpress' in drivers
+    # driver code isn't exported from libfprint, so build the matcher in
+    test('elanpress-match',
+        executable('test-elanpress-match',
+            sources: [
+                'test-elanpress-match.c',
+                files('../libfprint/drivers/elanpress-match.c'),
+            ],
+            dependencies: libfprint_private_dep,
+            c_args: common_cflags,
+            install: false),
+        suite: ['unit-tests'],
+        env: envs,
+        timeout: 120,
+    )
+endif
+
 test_utils = static_library('fprint-test-utils',
     sources: [
         'test-utils.c',
